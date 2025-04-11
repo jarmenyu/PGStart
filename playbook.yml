@@ -1,0 +1,205 @@
+- name: Установка и настройка PostgreSQL
+  hosts: primary
+  become: yes
+
+  vars:
+    postgres_version: "15"
+    postgres_password: "postgres"
+    student_password: "1290"
+    secondary_ip: "{{ hostvars['secondary']['ansible_host'] }}"
+
+  tasks:
+
+    - name: Показать дистрибутив
+      debug:
+        msg: "OS: {{ ansible_distribution }}"
+
+    - name: Установка PostgreSQL (Debian)
+      when: ansible_distribution == 'Debian'
+      block:
+        - name: Добавление APT ключа PostgreSQL (Debian)
+          apt_key:
+            url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+            state: present
+
+        - name: Добавление репозитория PostgreSQL (Debian)
+          apt_repository:
+            repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+            state: present
+            update_cache: yes
+
+        - name: Установка пакетов PostgreSQL (Debian)
+          apt:
+            name:
+              - postgresql-{{ postgres_version }}
+              - postgresql-client-{{ postgres_version }}
+              - python3-psycopg2
+            state: present
+            update_cache: yes
+
+        - name: Убедиться, что PostgreSQL запущен и включен (Debian)
+          service:
+            name: postgresql
+            state: started
+            enabled: yes
+
+        - name: Установка пароля для пользователя postgres (Debian)
+          shell: psql -c "ALTER USER postgres WITH PASSWORD '{{ postgres_password }}';"
+          become_user: postgres
+          changed_when: true
+
+        - name: Настройка PostgreSQL для прослушивания всех интерфейсов (Debian)
+          lineinfile:
+            path: /etc/postgresql/{{ postgres_version }}/main/postgresql.conf
+            regexp: "^#?listen_addresses\\s*="
+            line: "listen_addresses = '*'"
+            backup: yes
+          notify: restart postgresql
+
+        - name: Настройка pg_hba для локального доступа с md5 (Debian)
+          lineinfile:
+            path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+            regexp: "^local\\s+all\\s+postgres\\s+peer"
+            line: "local   all   postgres   md5"
+          notify: restart postgresql
+
+        - name: Настройка pg_hba для удаленного доступа (Debian)
+          postgresql_pg_hba:
+            dest: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+            contype: host
+            databases: all
+            users: all
+            source: 0.0.0.0/0
+            method: md5
+            create: yes
+          notify: restart postgresql
+
+    - name: Установка PostgreSQL (AlmaLinux)
+      when: ansible_distribution == 'AlmaLinux'
+      block:
+        - name: Импорт GPG ключа PostgreSQL (AlmaLinux)
+          rpm_key:
+            key: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            state: present
+
+        - name: Установка репозитория PostgreSQL (AlmaLinux)
+          dnf:
+            name: https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+            state: present
+            disable_gpg_check: yes
+
+        - name: Отключение встроенного модуля PostgreSQL (AlmaLinux)
+          command: dnf -qy module disable postgresql
+          args:
+            warn: false
+
+        - name: Установка пакетов PostgreSQL (AlmaLinux)
+          dnf:
+            name:
+              - postgresql{{ postgres_version }}-server
+              - postgresql{{ postgres_version }}-contrib
+              - python3-psycopg2
+            state: present
+
+        - name: Инициализация базы данных PostgreSQL (AlmaLinux)
+          command: /usr/pgsql-{{ postgres_version }}/bin/postgresql-{{ postgres_version }}-setup initdb
+          args:
+            creates: /var/lib/pgsql/{{ postgres_version }}/data/postgresql.conf
+
+        - name: Убедиться, что PostgreSQL запущен и включен (AlmaLinux)
+          service:
+            name: "postgresql-{{ postgres_version }}"
+            state: started
+            enabled: yes
+
+        - name: Установка пароля для пользователя postgres (AlmaLinux)
+          shell: psql -c "ALTER USER postgres WITH PASSWORD '{{ postgres_password }}';"
+          become_user: postgres
+          changed_when: true
+
+        - name: Настройка PostgreSQL для прослушивания всех интерфейсов (AlmaLinux)
+          lineinfile:
+            path: /var/lib/pgsql/{{ postgres_version }}/data/postgresql.conf
+            regexp: "^#?listen_addresses\\s*="
+            line: "listen_addresses = '*'"
+            backup: yes
+          notify: restart postgresql
+
+        - name: Настройка pg_hba для удаленного доступа (AlmaLinux)
+          postgresql_pg_hba:
+            dest: /var/lib/pgsql/{{ postgres_version }}/data/pg_hba.conf
+            contype: host
+            databases: all
+            users: all
+            source: 0.0.0.0/0
+            method: md5
+            create: yes
+          notify: restart postgresql
+
+        - name: Открытие порта в брандмауэре для PostgreSQL (AlmaLinux)
+          firewalld:
+            port: 5432/tcp
+            permanent: yes
+            state: enabled
+            immediate: yes
+
+    - name: Настройка пользователя student и базы данных
+      block:
+        - name: Create student database
+          postgresql_db:
+            name: student_db
+            state: present
+            login_user: postgres
+            login_password: "{{ postgres_password }}"
+            login_host: localhost
+
+        - name: Создание пользователя student
+          postgresql_user:
+            name: student
+            password: "{{ student_password }}"
+            state: present
+            login_user: postgres
+            login_password: "{{ postgres_password }}"
+            login_host: localhost
+
+        - name: Предоставление прав пользователю student
+          postgresql_privs:
+            database: student_db
+            roles: student
+            type: database
+            privs: ALL
+            grant_option: no
+            login_user: postgres
+            login_password: "{{ postgres_password }}"
+            login_host: localhost
+
+        - name: Настройка доступа для пользователя student с вторичного сервера
+          postgresql_pg_hba:
+            dest: "{{ '/etc/postgresql/' + postgres_version + '/main/pg_hba.conf' if ansible_distribution == 'Debian' else '/var/lib/pgsql/' + postgres_version + '/data/pg_hba.conf' }}"
+            contype: host
+            databases: student_db
+            users: student
+            source: "{{ secondary_ip }}/32"
+            method: md5
+            create: yes
+          notify: restart postgresql
+
+    - name: Тестирование подключения к PostgreSQL
+      postgresql_query:
+        query: "SELECT 1"
+        login_user: postgres
+        login_password: "{{ postgres_password }}"
+        login_host: localhost
+      register: test_query
+      failed_when: test_query.rowcount != 1
+      changed_when: false
+
+    - name: Показ результата теста
+      debug:
+        msg: "Тестирование подключения к PostgreSQL прошло успешно"
+
+  handlers:
+    - name: restart postgresql
+      service:
+        name: "{{ 'postgresql' if ansible_distribution == 'Debian' else 'postgresql-' + postgres_version }}"
+        state: restarted

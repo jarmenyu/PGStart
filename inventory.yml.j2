@@ -1,0 +1,9 @@
+all:
+  hosts:
+    primary:
+      ansible_host: "{{ primary_ip }}"
+    secondary:
+      ansible_host: "{{ secondary_ip }}"
+  vars:
+    ansible_user: root
+    ansible_ssh_private_key_file: /home/arslan/.ssh/id_rsa
